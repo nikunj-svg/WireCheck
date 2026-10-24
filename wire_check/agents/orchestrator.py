@@ -1,5 +1,12 @@
+
+import asyncio
+import json
+import os
 import time
 from typing import Optional
+from datetime import datetime, timezone
+from uuid import uuid4
+
 from wire_check.models import IntakeRequest, WorkflowResponse
 from wire_check.agents.entity import resolve_entity
 from wire_check.agents.sanctions import screen_entity
@@ -10,46 +17,56 @@ from wire_check.utils.logger import get_logger
 
 logger = get_logger("orchestrator_agent")
 
+try:
+    from uagents import Agent, Context, Model, Protocol
+    from uagents_core.contrib.protocols.chat import (
+        ChatMessage,
+        ChatAcknowledgement,
+        TextContent,
+        EndSessionContent,
+        chat_protocol_spec,
+    )
+    HAS_UAGENTS = True
+except ImportError:
+    HAS_UAGENTS = False
+
+
 def run_wire_check_workflow(intake: IntakeRequest) -> WorkflowResponse:
-    """Executes the end-to-end Wire Check multi-agent workflow:
-    Intake -> Entity Resolution -> Sanctions & Payment-Fraud -> Decision Engine.
-    Enforces the mandatory Source-of-Truth dependency: Entity canonical name & website feed Sanctions and Fraud.
-    """
+    """Run the local entity, sanctions, fraud and decision workflow."""
     start_time = time.time()
-    logger.info(f"Starting Wire Check workflow for supplier: {intake.company_name} (Amount: ${intake.amount:,.2f})")
 
-    # Step 1: Entity Resolution
+    logger.info(
+        f"Starting workflow for {intake.company_name}, "
+        f"amount={intake.amount}"
+    )
+
     entity_res = resolve_entity(intake)
-
-    # Step 2: Sanctions screening (using canonical name & aliases from Entity agent)
     sanctions_res = screen_entity(entity_res)
-
-    # Step 3: Payment-fraud checks (using entity website reference)
     fraud_res = run_fraud_checks(intake, entity_res)
+    decision_res = make_decision(
+        intake, entity_res, sanctions_res, fraud_res
+    )
 
-    # Step 4: Decision Engine (Jev / Rules + Safety Overrides)
-    decision_res = make_decision(intake, entity_res, sanctions_res, fraud_res)
-
-    total_duration_ms = (time.time() - start_time) * 1000.0
-    logger.info(f"Workflow completed in {total_duration_ms:.1f}ms. Final Decision: {decision_res.decision}")
+    logger.info(
+        f"Workflow completed in "
+        f"{(time.time() - start_time) * 1000:.1f}ms"
+    )
 
     return WorkflowResponse(
         intake=intake,
         entity=entity_res,
         sanctions=sanctions_res,
         fraud=fraud_res,
-        decision=decision_res
+        decision=decision_res,
     )
 
-# uAgents integration setup for Agentverse & ASI:One (Agent Chat Protocol)
-try:
-    from uagents import Agent, Context, Model, Protocol
-    from uagents.experimental.chat_agent import ChatProtocol, LLMConfig
-    HAS_UAGENTS = True
-except ImportError:
-    HAS_UAGENTS = False
 
 if HAS_UAGENTS:
+
+    # Address of the remote Wire-Check-jev ACP agent.
+    JEV_ADDRESS = os.getenv("WIRE_CHECK_JEV_ADDRESS", "").strip()
+    JEV_TIMEOUT_SECONDS = 35
+
     class WireCheckQuery(Model):
         company_name: str
         country: str
@@ -60,31 +77,137 @@ if HAS_UAGENTS:
         amount: float
         recent_bank_change: bool = False
 
+        # Additional fields needed by the verification API.
+        website: Optional[str] = None
+        beneficiary_name: Optional[str] = None
+        payment_currency: str = "USD"
+        invoice_text: Optional[str] = None
+
     class WireCheckResponse(Model):
         status: str
         decision: str
         evidence: list[str]
         callback_script: Optional[str] = None
+        jev_result: Optional[str] = None
 
-    # Initialize Agent with mailbox=True and port 8001 (name restored to wire_check_orchestrator)
     wire_check_agent = Agent(
         name="wire_check_orchestrator",
         seed=AGENT_SEED,
         mailbox=True,
-        port=8001
+        port=8001,
     )
-    logger.info("Initialized Wire Check Agent with official ChatProtocol and mailbox=True.")
 
-    # 1. Include official ChatProtocol with publish_manifest=True so Agentverse recognizes official ACP signature
-    official_chat_proto = ChatProtocol(llm_config=LLMConfig.asi1(), tools={})
-    wire_check_agent.include(official_chat_proto, publish_manifest=True)
+    # ACP protocol used to communicate with Wire-Check-jev.
+    jev_protocol = Protocol(spec=chat_protocol_spec)
 
-    # 2. Define custom protocol for Wire Check workflow queries & responses
-    wire_check_proto = Protocol(name="WireCheckWorkflow", version="1.0")
+    # This prototype allows one in-flight ACP verification at a time.
+    jev_lock = asyncio.Lock()
+    jev_pending_future = None
 
-    @wire_check_proto.on_message(model=WireCheckQuery, replies={WireCheckResponse})
-    async def handle_wire_check_query(ctx: Context, sender: str, msg: WireCheckQuery):
-        ctx.logger.info(f"Received Wire Check query from {sender} for company {msg.company_name}")
+    @jev_protocol.on_message(ChatMessage)
+    async def handle_jev_chat(
+        ctx: Context, sender: str, msg: ChatMessage
+    ):
+        global jev_pending_future
+
+        # Accept replies only from the configured remote agent.
+        if not JEV_ADDRESS or sender != JEV_ADDRESS:
+            ctx.logger.info(
+                f"Ignoring ACP message from unconfigured sender: {sender}"
+            )
+            return
+
+        reply_text = "\n".join(
+            item.text
+            for item in msg.content
+            if isinstance(item, TextContent)
+        ).strip()
+
+        if jev_pending_future is not None and not jev_pending_future.done():
+            jev_pending_future.set_result(reply_text)
+        else:
+            ctx.logger.info(f"Unmatched ACP reply: {reply_text}")
+
+    @jev_protocol.on_message(ChatAcknowledgement)
+    async def handle_jev_ack(
+        ctx: Context, sender: str, msg: ChatAcknowledgement
+    ):
+        ctx.logger.info(f"ACP acknowledgement received from {sender}")
+
+    wire_check_agent.include(jev_protocol, publish_manifest=True)
+
+    async def call_jev(ctx: Context, msg: WireCheckQuery) -> str:
+        """Send supplier details to Jev and wait for its ACP response."""
+        global jev_pending_future
+
+        if not JEV_ADDRESS:
+            raise RuntimeError(
+                "WIRE_CHECK_JEV_ADDRESS is not configured."
+            )
+
+        # Do not invent missing supplier or beneficiary information.
+        payload = {
+            "supplierName": msg.company_name,
+            "country": msg.country,
+            "website": msg.website or "",
+            "registrationNumber": msg.registration_number or "",
+            "beneficiaryName": msg.beneficiary_name or "",
+            "isBankDetailsNewOrChanged": msg.recent_bank_change,
+            "paymentAmount": msg.amount,
+            "paymentCurrency": msg.payment_currency,
+            "invoiceText": msg.invoice_text or (
+                f"IBAN: {msg.iban}\n"
+                f"Bank country: {msg.bank_country}\n"
+                f"Invoice email domain: {msg.invoice_email_domain}"
+            ),
+        }
+
+        async with jev_lock:
+            loop = asyncio.get_running_loop()
+            jev_pending_future = loop.create_future()
+
+            outgoing = ChatMessage(
+                timestamp=datetime.now(timezone.utc),
+                msg_id=uuid4(),
+                content=[
+                    TextContent(
+                        type="text",
+                        text=json.dumps(payload),
+                    ),
+                    EndSessionContent(type="end-session"),
+                ],
+            )
+
+            try:
+                ctx.logger.info(
+                    f"Sending ACP verification request to {JEV_ADDRESS}"
+                )
+                await ctx.send(JEV_ADDRESS, outgoing)
+
+                return await asyncio.wait_for(
+                    jev_pending_future,
+                    timeout=JEV_TIMEOUT_SECONDS,
+                )
+            finally:
+                jev_pending_future = None
+
+    # Keep the custom query protocol for existing callers.
+    wire_check_proto = Protocol(
+        name="WireCheckWorkflow",
+        version="1.0",
+    )
+
+    @wire_check_proto.on_message(
+        model=WireCheckQuery,
+        replies={WireCheckResponse},
+    )
+    async def handle_wire_check_query(
+        ctx: Context, sender: str, msg: WireCheckQuery
+    ):
+        ctx.logger.info(
+            f"Received query from {sender}: {msg.company_name}"
+        )
+
         intake = IntakeRequest(
             company_name=msg.company_name,
             country=msg.country,
@@ -93,24 +216,79 @@ if HAS_UAGENTS:
             bank_country=msg.bank_country,
             invoice_email_domain=msg.invoice_email_domain,
             amount=msg.amount,
-            recent_bank_change=msg.recent_bank_change
+            recent_bank_change=msg.recent_bank_change,
         )
-        response = run_wire_check_workflow(intake)
+
+        # Run the existing local multi-agent workflow.
+        try:
+            response = await asyncio.to_thread(
+                run_wire_check_workflow, intake
+            )
+
+            decision = response.decision.decision
+            evidence = list(response.decision.evidence)
+            callback_script = response.decision.callback_script
+
+        except Exception as exc:
+            ctx.logger.exception(f"Local workflow failed: {exc}")
+            await ctx.send(
+                sender,
+                WireCheckResponse(
+                    status="error",
+                    decision="HOLD",
+                    evidence=[
+                        "Local workflow failed; manual review required."
+                    ],
+                ),
+            )
+            return
+
+        # Ask the remote Jev agent for its independent verification.
+        jev_result = None
+        status = "success"
+
+        try:
+            jev_result = await call_jev(ctx, msg)
+            evidence.append(
+                "Wire-Check-jev ACP response: " + jev_result
+            )
+        except Exception as exc:
+            status = "partial"
+            ctx.logger.warning(
+                f"Jev verification unavailable: {exc}"
+            )
+            evidence.append(
+                "Remote Jev verification unavailable. "
+                "The local workflow result is returned; "
+                "remote verification was not completed."
+            )
+
         await ctx.send(
             sender,
             WireCheckResponse(
-                status="success",
-                decision=response.decision.decision,
-                evidence=response.decision.evidence,
-                callback_script=response.decision.callback_script
-            )
+                status=status,
+                decision=decision,
+                evidence=evidence,
+                callback_script=callback_script,
+                jev_result=jev_result,
+            ),
         )
 
     wire_check_agent.include(wire_check_proto)
 
+    @wire_check_agent.on_event("startup")
+    async def startup(ctx: Context):
+        ctx.logger.info(
+            f"Orchestrator address: {wire_check_agent.address}"
+        )
+        ctx.logger.info(
+            f"Jev address configured: {bool(JEV_ADDRESS)}"
+        )
+
+
 if __name__ == "__main__":
     if HAS_UAGENTS:
-        print("Starting Wire Check Orchestrator uAgent...")
+        print("Starting Wire Check Orchestrator...")
         wire_check_agent.run()
     else:
-        print("uAgents package not installed. Run 'pip install uagents' or check requirements.")
+        print("Install uagents and uagents-core dependencies first.")
